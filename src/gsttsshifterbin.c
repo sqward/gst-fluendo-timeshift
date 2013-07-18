@@ -42,12 +42,12 @@ static void gst_ts_shifter_bin_handle_message (GstBin * bin, GstMessage * msg);
 static GstStaticPadTemplate srctemplate = GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS ("video/mpegts"));
+    GST_STATIC_CAPS ("video/mpegts, " "systemstream = (boolean) true "));
 
 static GstStaticPadTemplate sinktemplate = GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS ("video/mpegts"));
+    GST_STATIC_CAPS ("video/mpegts, " "systemstream = (boolean) true "));
 
 static void
 gst_ts_shifter_bin_set_property (GObject * object,
@@ -196,6 +196,128 @@ error:
   gst_element_clear (&ts_bin->seeker);
 }
 
+/* gets a real pad peer, ie. the that is not a proxy */
+
+static GstPad * 
+gst_ts_shifter_get_real_peer_pad( GstPad * pad, GstElement * common_parent )
+{
+  GstPad * peer = gst_pad_get_peer (pad);
+  
+  if ( GST_IS_PROXY_PAD(peer) )
+  {
+     /* it's a proxypad so find real pad (which will be a ghostpad) */
+    GstIterator *pI = gst_pad_iterate_internal_links(peer);
+    GstPad* rp = NULL;
+    GValue realpeer = { 0, } ;
+    GstIteratorResult res;
+    res = gst_iterator_next (pI,&realpeer);
+    gst_iterator_free (pI);
+    if (res != GST_ITERATOR_OK)
+    {
+      return NULL;
+    }
+    gst_object_unref (peer);
+
+    peer = GST_PAD(g_value_get_object (&realpeer));
+    gst_object_ref (peer);
+    g_value_unset(&realpeer);
+  }
+
+  return peer;
+}
+
+static GstPadProbeReturn
+gst_ts_shifter_pad_event_cb (
+  GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  GstElement *toremove = GST_ELEMENT (user_data);
+  GstElement *parentbin = NULL;
+  GstPad *upstreampeer = NULL;
+  GstPad *downstreampeer = NULL;
+  GstPad * srcpad, *sinkpad;
+
+  if (GST_EVENT_TYPE (GST_PAD_PROBE_INFO_DATA (info)) != GST_EVENT_EOS)
+    return GST_PAD_PROBE_OK;
+
+  parentbin = gst_element_get_parent(toremove);
+
+  gst_pad_remove_probe (pad, GST_PAD_PROBE_INFO_ID (info));
+
+  srcpad = gst_element_get_static_pad (toremove, "src");
+  downstreampeer = gst_ts_shifter_get_real_peer_pad(srcpad, parentbin);
+  gst_object_unref (srcpad);
+
+  sinkpad = gst_element_get_static_pad (toremove, "sink");
+  upstreampeer = gst_ts_shifter_get_real_peer_pad(sinkpad, parentbin);
+  gst_object_unref (sinkpad);
+
+  gst_element_set_state (toremove, GST_STATE_NULL);
+
+  /* remove unlinks automatically */
+  GST_DEBUG_OBJECT (parentbin, "removing %" GST_PTR_FORMAT, toremove);
+  gst_bin_remove (GST_BIN (parentbin), toremove);
+
+  GST_DEBUG_OBJECT (toremove, "linking..");
+  
+  if ( GST_IS_GHOST_PAD(upstreampeer) ) {
+    /* handle the case when we removed an element at the begining of a bin */
+    g_return_if_fail (
+      gst_ghost_pad_set_target( GST_GHOST_PAD(upstreampeer), downstreampeer ) );
+  } else if ( GST_IS_GHOST_PAD(downstreampeer) ) {
+    /* handle the case when we removed an element at the end of a bin */
+    g_return_if_fail ( 
+      gst_ghost_pad_set_target( GST_GHOST_PAD(downstreampeer), upstreampeer ) );
+  } else {
+    gst_pad_link (upstreampeer, downstreampeer);
+  }
+  gst_object_unref (downstreampeer);
+  gst_object_unref (upstreampeer);
+
+  GST_DEBUG_OBJECT (parentbin, "done");
+  gst_object_unref (parentbin);
+
+  return GST_PAD_PROBE_DROP;
+}
+
+static GstPadProbeReturn
+gst_ts_shifter_padblocked_cb(
+  GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  GstElement *toremove = GST_ELEMENT (user_data);
+  GstPad *srcpad, *sinkpad;
+
+  GST_DEBUG_OBJECT (pad, "pad is blocked now");
+
+  /* install new probe for EOS */
+  srcpad = gst_element_get_static_pad (toremove, "src");
+  gst_pad_add_probe (srcpad, GST_PAD_PROBE_TYPE_BLOCK | 
+    GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, gst_ts_shifter_pad_event_cb,
+    user_data, NULL);
+  gst_object_unref (srcpad);
+
+  sinkpad = gst_element_get_static_pad (toremove, "sink");
+  gst_pad_send_event (sinkpad, gst_event_new_eos ());
+  gst_object_unref (sinkpad);
+  gst_object_unref (toremove);
+
+  return GST_PAD_PROBE_REMOVE;
+}
+
+static void 
+gst_ts_shifter_remove_element(GstElement *toremove)
+{
+  GstPad *sinkpad = gst_element_get_static_pad (toremove, "sink");
+  GstPad *blockpad = gst_pad_get_peer(sinkpad);
+  gst_object_unref (sinkpad);
+
+  gst_object_ref (toremove);
+
+  gst_pad_add_probe (blockpad, GST_PAD_PROBE_TYPE_BLOCK_DOWNSTREAM,
+      gst_ts_shifter_padblocked_cb, (gpointer)toremove, NULL);
+
+  gst_object_unref (blockpad);
+}
+
 static void
 gst_ts_shifter_bin_handle_message (GstBin * bin, GstMessage * msg)
 {
@@ -212,6 +334,9 @@ gst_ts_shifter_bin_handle_message (GstBin * bin, GstMessage * msg)
 
     GST_DEBUG ("Setting PCR PID: %u", pcr_pid);
     g_object_set (ts_bin->indexer, "pcr-pid", pcr_pid, NULL);
+
+    gst_ts_shifter_remove_element(ts_bin->parser);
+    ts_bin->parser = NULL;
   }
 
   GST_BIN_CLASS (gst_ts_shifter_bin_parent_class)
