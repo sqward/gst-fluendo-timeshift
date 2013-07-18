@@ -89,10 +89,10 @@ G_DEFINE_TYPE (GstTSShifter, gst_ts_shifter, GST_TYPE_ELEMENT);
 #define parent_class gst_ts_shifter_parent_class
 
 static GstStaticPadTemplate src_factory = GST_STATIC_PAD_TEMPLATE ("src",
-    GST_PAD_SRC, GST_PAD_ALWAYS, GST_STATIC_CAPS ("video/mpegts"));
+    GST_PAD_SRC, GST_PAD_ALWAYS, GST_STATIC_CAPS ("video/mpegts, " "systemstream = (boolean) true "));
 
 static GstStaticPadTemplate sink_factory = GST_STATIC_PAD_TEMPLATE ("sink",
-    GST_PAD_SINK, GST_PAD_ALWAYS, GST_STATIC_CAPS ("video/mpegts"));
+    GST_PAD_SINK, GST_PAD_ALWAYS, GST_STATIC_CAPS ("video/mpegts, " "systemstream = (boolean) true "));
 
 static guint gst_ts_shifter_signals[LAST_SIGNAL] = { 0 };
 

@@ -89,14 +89,14 @@ static GstStaticPadTemplate gst_ts_indexer_sink_template =
 GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS ("video/mpegts")
+    GST_STATIC_CAPS ("video/mpegts, " "systemstream = (boolean) true ")
     );
 
 static GstStaticPadTemplate gst_ts_indexer_src_template =
 GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS ("video/mpegts")
+    GST_STATIC_CAPS ("video/mpegts, " "systemstream = (boolean) true ")
     );
 
 
