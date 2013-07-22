@@ -267,8 +267,12 @@ gst_ts_shifter_pad_event_cb (
     /* handle the case when we removed an element at the end of a bin */
     g_return_if_fail ( 
       gst_ghost_pad_set_target( GST_GHOST_PAD(downstreampeer), upstreampeer ) );
-  } else {
+  } else if ( !GST_IS_GHOST_PAD(upstreampeer) 
+              && !GST_IS_GHOST_PAD(downstreampeer) ) {
     gst_pad_link (upstreampeer, downstreampeer);
+  } else {
+      GST_ERROR ("Couldn't connect ghost pads. Perhaps you're trying to remove"
+                " the last element from the bin?");
   }
   gst_object_unref (downstreampeer);
   gst_object_unref (upstreampeer);
