@@ -35,6 +35,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <fcntl.h>
+#include <assert.h>
 
 GST_DEBUG_CATEGORY_EXTERN (ts_flow);
 #define GST_CAT_DEFAULT (ts_flow)
@@ -43,8 +44,6 @@ GST_DEBUG_CATEGORY_EXTERN (ts_flow);
 #define DEBUG_RINGBUFFER 0
 
 #define INVALID_OFFSET ((guint64) -1)
-
-typedef struct _Slot Slot;
 
 /*
  * Page cache management
@@ -66,10 +65,10 @@ typedef struct _Slot Slot;
  *
  * So we define two values:
  *
- *  * PAGE_SYNC_TIME_SLOTS - how long do we want to give the kernel to write
+ *  * PAGE_SYNC_TIME_BYTES - how long do we want to give the kernel to write
  *    newly written pages to disk before we block until pages are successfully
  *    written.
- *  * READ_KEEP_PAGE_SLOTS - Don't throw pages away if the read head is going
+ *  * READ_KEEP_PAGE_BYTES - Don't throw pages away if the read head is going
  *    to be needing them.
  *
  * Diagram:
@@ -81,8 +80,8 @@ typedef struct _Slot Slot;
  *              r−−−−>                    <−−−−w - write head plus line showing
  *                  <−−−−−−−−−−−w                  PAGE_SYNC_TIME_SLOTS
  * -------------#################······   ······ - Unwritten slots
- *                                        ###### - Slots in page cache
- *                    r−−−−>              ------ - Written slots not in page
+ *                                        ###### - Pages possibly in page cache
+ *                    r−−−−>              ------ - Written pages not in page
  *                  <−−−−−−−−−−−w                  cache
  * -----------------#############······
  *
@@ -97,9 +96,9 @@ typedef struct _Slot Slot;
  * even if it occurs.
  */
 
-#define PAGE_SYNC_TIME_SLOTS (20)       /* 640kB */
-#define READ_KEEP_PAGE_SLOTS (10)       /* 320kB */
-
+#define PAGE_SYNC_TIME_BYTES (640 * 1024)       /* 640kB */
+#define READ_KEEP_PAGE_BYTES (320 * 1024)       /* 320kB */
+#define PAGE_SIZE (4 * 1024)                    /* 4KB*/
 /* GstTSCache */
 
 struct _GstTSCache
@@ -108,24 +107,20 @@ struct _GstTSCache
 
   GMutex lock;
 
-  guint64 h_offset;             /* highest offset */
-  guint64 l_rb_offset;          /* lowest offset in the ringbuffer */
-  guint64 h_rb_offset;          /* highest offset in the ringbuffer (FULL slots) */
+  gboolean flushing;
 
   gboolean need_discont;
 
-  /* ring buffer */
-  guint nslots;
-  volatile gint fslots;         /* number of full slots */
-  Slot *slots;
-
-  guint head;
-  guint tail;
-
-  GstClockTime mtime;           /* timestamp when migration started */
-
+  int output_buffer_size;
   int write_fd;
   int read_fd;
+
+  /* All of these are in stream offset, not offset into timeshift file.  The
+   * latter are derived quantities. */
+  off64_t write_head;
+  off64_t read_head;
+  
+  off64_t buffer_size;
 };
 
 #define GST_CACHE_LOCK(cache) G_STMT_START {                                \
@@ -136,176 +131,266 @@ struct _GstTSCache
   g_mutex_unlock (&cache->lock);                                            \
 } G_STMT_END
 
-typedef enum
+static off64_t
+stream_to_file_offset(GstTSCache * cache, off64_t stream )
 {
-  STATE_EMPTY = 0,
-  STATE_PART = 1,
-  STATE_FULL = 2,
-  STATE_POP = 3,
-  STATE_RECYCLE = 4
-} CacheState;
-
-/* Slot manager */
-
-struct _Slot
-{
-  volatile gint state;
-
-  guint32 size;
-
-  /* Offset into the timeshift backing store of this slot */
-  off64_t offset;
-
-  /* Offset in bytes from beginning of the stream (e.g. GstBuffer offset) */
-  off64_t stream_offset;
-};
-
-static inline gboolean
-slot_available (Slot * slot, gsize * size)
-{
-  CacheState state = g_atomic_int_get (&slot->state);
-
-  if (state <= STATE_PART) {
-    if (size) {
-      *size = CACHE_SLOT_SIZE - slot->size;
-    }
-    return TRUE;
-  }
-
-  return FALSE;
+  return stream % cache->buffer_size;
 }
 
-#define TS_FLOW_REQUIRE_MORE_DATA GST_FLOW_CUSTOM_SUCCESS
-#define TS_FLOW_SLOT_FILLED GST_FLOW_CUSTOM_SUCCESS_1
-
-/* returns TRUE if slot is full */
-static inline GstFlowReturn
-slot_write (int fd, Slot * slot, guint8 * data, guint size,
-    guint64 stream_offset)
+static inline off64_t get_recycle_head(GstTSCache * cache)
 {
-  slot->stream_offset = stream_offset;
+  return MAX( cache->write_head-cache->buffer_size,0);
+}
 
-  if (lseek (fd, slot->offset + slot->size, SEEK_SET) == -1) {
-    GST_WARNING ("Timeshift buffer seek failed: %s", strerror (errno));
-    goto err;
+typedef struct Range_
+{
+  off64_t offset;
+  off64_t size;
+} Range;
+
+static Range
+page_align(Range x)
+{
+  off64_t begin = x.offset, end = x.offset + x.size;
+  begin = begin - begin % PAGE_SIZE;
+  end = end - end % PAGE_SIZE;
+  x.offset = begin;
+  x.size = end - begin;
+  return x;
+}
+
+static gboolean
+range_overlaps(Range a, Range b)
+{
+  return ((a.offset + a.size) > b.offset) && ((b.offset + b.size) > a.offset);
+}
+
+static void
+range_consume (Range *r, off64_t bytes)
+{
+  assert (r);
+  r->offset += bytes;
+  if (bytes <= r->size)
+    r->size -= bytes;
+  else
+    r->size = 0;
+}
+
+static Range
+next_contiguous_range (GstTSCache *cache, Range r)
+{
+  r.offset = stream_to_file_offset (cache, r.offset);
+  /* If we're going to wrap break up our writes: */
+  if (r.offset + r.size > cache->buffer_size)
+    r.size = cache->buffer_size - r.offset;
+
+  return r;
+}
+
+static Range
+consume_contiguous_range (GstTSCache *cache, Range *r)
+{
+  Range out = next_contiguous_range (cache, *r);
+  range_consume (r, out.size);
+  return out;
+}
+
+static inline GstFlowReturn
+buffer_write_locked (GstTSCache * cache, guint8 * data, guint size)
+{
+  Range for_writing = {cache->write_head, size};
+  Range for_writeout = {cache->write_head, size};
+  Range for_cache_force_out = {cache->write_head, size};
+  Range for_cache_dropping = {cache->write_head, size};
+  Range r;
+
+  off64_t new_recycle_head = MAX(cache->write_head + size - cache->buffer_size, 0);
+  if (cache->read_head < new_recycle_head) {
+    GST_WARNING ("no space in the buffer!");
+    return GST_FLOW_ERROR;
   }
-  while (size > 0) {
-    /* TODO: poll first to make these writes interruptable */
-    ssize_t bytes_written = write (fd, data, size);
+
+  while ((r = next_contiguous_range(cache, for_writing)).size > 0) {
+    ssize_t bytes_written = 0;
+    int write_errno;
+
+    /* we've wrapped */
+    if (r.offset == 0) {
+      GST_INFO("Timeshifter: wrapping");
+      if (lseek (cache->write_fd, 0, SEEK_SET) == -1) {
+        GST_WARNING ("Timeshift buffer seek failed: %s", strerror (errno));
+        GST_CACHE_LOCK (cache);
+        return GST_FLOW_ERROR;
+      }
+    }
+
+    GST_CACHE_UNLOCK (cache);
+    bytes_written = write(cache->write_fd, data, r.size);
+    write_errno = errno;
+    GST_CACHE_LOCK (cache);
+
     if (bytes_written < 0) {
       if (errno == EAGAIN)
         continue;
       else {
         GST_WARNING ("Timeshift buffer write failed: %s", strerror (errno));
-        goto err;
+        return GST_FLOW_ERROR;
       }
     } else {
-      size -= bytes_written;
+      range_consume(&for_writing, bytes_written);
       data += bytes_written;
-      slot->size += bytes_written;
+      cache->write_head += bytes_written;
     }
   }
 
-  if (slot->size == CACHE_SLOT_SIZE) {
-    g_atomic_int_set (&slot->state, STATE_FULL);
-    return TS_FLOW_SLOT_FILLED;
-  } else {
-    g_atomic_int_set (&slot->state, STATE_PART);
-    return TS_FLOW_REQUIRE_MORE_DATA;
+  while ((r = consume_contiguous_range(cache, &for_writeout)).size > 0) {
+    r = page_align(r);
+    if (r.size > 0) {
+      g_warn_if_fail (sync_file_range (cache->write_fd, r.offset,
+        r.size, SYNC_FILE_RANGE_WRITE) == 0);
+    }
   }
-err:
-  return GST_FLOW_ERROR;
+
+  for_cache_force_out.offset -= PAGE_SYNC_TIME_BYTES;
+  if (for_cache_force_out.offset < 0) {
+    range_consume (&for_cache_force_out, -for_cache_force_out.offset);
+  }
+  for_cache_dropping = for_cache_force_out;
+  while ((r = consume_contiguous_range(cache, &for_cache_force_out)).size > 0) {
+    r = page_align(r);
+    if (r.size > 0) {
+      /* Make sure the pages from a while ago have been written out by now. */
+      /* once slots has been removed it's a bit tricky to know anything */
+      g_warn_if_fail (sync_file_range (cache->write_fd,
+              r.offset, r.size,
+              SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE |
+              SYNC_FILE_RANGE_WAIT_AFTER) == 0);
+    }
+  }
+
+  /* And drop them from the cache unless they're going to be needed by
+   * the read head soon.  e.g. if
+   * (read head < writeout_idx < read_head + READ_KEEP_PAGE_SLOTS) */
+  Range read_ahead_region = {cache->read_head, READ_KEEP_PAGE_BYTES};
+  if (!range_overlaps(read_ahead_region, for_cache_dropping)) {
+    while ((r = consume_contiguous_range(cache, &for_cache_dropping)).size > 0) {
+      r = page_align(r);
+      if (r.size > 0) {
+        g_warn_if_fail (posix_fadvise64 (cache->write_fd,
+                r.offset, r.size,
+                POSIX_FADV_DONTNEED) == 0);
+      }
+    }
+  }
+
+  return GST_FLOW_OK;
 }
 
 /* Slot Buffer */
 
-typedef struct MmappedSlotContext_
+typedef struct BufferContext_
 {
-  Slot *slot;
   GstTSCache *cache;
   gpointer data;
-} MmappedSlotContext;
+  Range file_range;
+} BufferContext;
 
 static void
-munmap_slot (gpointer * data)
+cleanup_buffer (gpointer * data)
 {
-  MmappedSlotContext *ctx = (MmappedSlotContext *) data;
-  g_warn_if_fail (munmap (ctx->data, CACHE_SLOT_SIZE) == 0);
+  BufferContext *ctx = (BufferContext *) data;
+  GstTSCache * cache = ctx->cache;
+
   /* Avoid trashing caches.  This will fail if the pages haven't hit disk yet
    * but that's OK as in that case the write head will take care of it. */
-  g_warn_if_fail (posix_fadvise64 (ctx->cache->read_fd, ctx->slot->offset,
-          CACHE_SLOT_SIZE, POSIX_FADV_DONTNEED) == 0);
-  g_atomic_int_set (&ctx->slot->state, STATE_RECYCLE);
-
-  g_slice_free (MmappedSlotContext, ctx);
+  Range r = page_align(ctx->file_range);
+  if (r.size > 0) {
+    g_warn_if_fail (posix_fadvise64 (cache->write_fd,
+            r.offset, r.size,
+            POSIX_FADV_DONTNEED) == 0);
+  }
+  g_free (ctx->data);
+  g_slice_free (BufferContext, ctx);
 }
 
 static GstBuffer *
-gst_slot_buffer_new (GstTSCache * cache, Slot * slot)
+buffer_new_locked (GstTSCache * cache)
 {
-  MmappedSlotContext *ctx;
-
-  gpointer data = mmap (NULL, CACHE_SLOT_SIZE, PROT_READ,
-      MAP_PRIVATE | MAP_POPULATE, cache->read_fd,
-      slot->offset);
-  if (data == NULL) {
-    GST_ERROR ("mmaping timeshift buffer failed: %s", strerror (errno));
-    goto err;
+  BufferContext *ctx;
+  off64_t ro = stream_to_file_offset(cache, cache->read_head);
+  gint64 read_bytes = 0;
+  /* Make sure we can produce buffer with satisfactory size. 
+   * this is important because small buffers can cause performance
+   * issues especially on embedded systems
+   */
+  if ( cache->read_head + cache->output_buffer_size >= cache->write_head ) {
+    return NULL;
   }
 
-  ctx = g_slice_new (MmappedSlotContext);
-  ctx->slot = slot;
+  /* On buffer wrap a tiny buffer could be generated because only a portion
+   * of the buffer would be linear in the file. So as a simplification only that
+   * bit of a buffer is taken. In reality this would rearly happen or not happen
+   * at all so such a code simplification is desired.
+   */
+
+  size_t out_size = 
+    ( ro + cache->output_buffer_size <= cache->buffer_size ) ?
+      cache->output_buffer_size : cache->buffer_size - ro;
+
+  if ( out_size == 0 ) {
+    out_size = cache->output_buffer_size;
+    ro = 0;
+  }
+
+  ctx = g_slice_new (BufferContext);
+  if ( !ctx ){
+    GST_ERROR ("g_slice_new (BufferContext) failed");    
+  }
+
+  ctx->data = g_malloc( out_size );
+
+  GST_CACHE_UNLOCK (cache);
+
+  if (lseek (cache->read_fd, ro, SEEK_SET) == -1) {
+    GST_WARNING ("Timeshift buffer seek failed: %s", strerror (errno));
+    GST_CACHE_LOCK (cache);
+    return NULL;
+  }
+
+  read_bytes = read( cache->read_fd, ctx->data, out_size );
+  GST_CACHE_LOCK (cache);
+
+  if ( read_bytes < 0 ) {
+    GST_ERROR ("couldn't read from the ringbuffer (read) failed%s", 
+      strerror (errno));
+  }
+
   ctx->cache = cache;
-  ctx->data = data;
+  ctx->file_range.offset = ro;
+  ctx->file_range.size = read_bytes;
 
   GstBuffer *buffer =
-      gst_buffer_new_wrapped_full (GST_MEMORY_FLAG_READONLY, data,
-      CACHE_SLOT_SIZE, 0, CACHE_SLOT_SIZE, ctx,
-      munmap_slot);
+      gst_buffer_new_wrapped_full (GST_MEMORY_FLAG_READONLY, ctx->data,
+      cache->output_buffer_size, 0, out_size, ctx,
+      (gpointer) cleanup_buffer);
 
-  GST_BUFFER_OFFSET (buffer) = slot->stream_offset;
-  GST_BUFFER_OFFSET_END (buffer) = slot->stream_offset + slot->size;
+  GST_BUFFER_OFFSET (buffer) = cache->read_head;
+  GST_BUFFER_OFFSET_END (buffer) = cache->read_head + cache->output_buffer_size;
+
+  cache->read_head += out_size;
 
   return buffer;
-err:
-  return NULL;
 }
 
-static void
-dump_cache_state (GstTSCache * cache, const gchar * title)
-{
-  static const gchar *state_names[] =
-      { "EMPTY   ", "PART    ", "FULL    ", "POP     ", "RECYCLE " };
-  gint i;
-  GST_DEBUG ("---> %s \t head: %d tail: %d nslots: %d fslots: %d",
-      title, cache->head, cache->tail, cache->nslots,
-      g_atomic_int_get (&cache->fslots));
-  GST_DEBUG ("     h_rb_offset %" G_GUINT64_FORMAT " l_rb_offset %"
-      G_GUINT64_FORMAT " h_offset %" G_GUINT64_FORMAT,
-      cache->h_rb_offset, cache->l_rb_offset, cache->h_offset);
-
-  for (i = 0; i < cache->nslots; i++) {
-    Slot *slot = &cache->slots[i];
-    CacheState state = g_atomic_int_get (&slot->state);
-    GST_LOG ("     %d. %s size %" G_GUINT32_FORMAT " offset %"
-        G_GUINT64_FORMAT, i, state_names[state],
-        slot->size, slot->stream_offset);
-  }
-}
 
 static inline void
 gst_ts_cache_flush (GstTSCache * cache)
 {
-  guint i;
-  for (i = 0; i < cache->nslots; i++) {
-    Slot *slot = &cache->slots[i];
-    slot->state = STATE_EMPTY;
-    slot->stream_offset = INVALID_OFFSET;
-    slot->size = 0;
-  }
-  cache->head = cache->tail = 0;
-  cache->fslots = 0;
+  GST_CACHE_LOCK (cache);
+  cache->write_head = 0;
+  cache->read_head = 0;
   cache->need_discont = TRUE;
+  GST_CACHE_UNLOCK (cache);
 }
 
 static int
@@ -314,7 +399,7 @@ reopen (int fd, int flags)
   char *filename;
   int newfd, errno_tmp;
 
-  filename = g_strdup_printf ("/proc/%u/fd/%i", (unsigned long) getpid (), fd);
+  filename = g_strdup_printf ("/proc/%u/fd/%i", (unsigned) getpid (), fd);
   newfd = open (filename, flags);
   errno_tmp = errno;
   g_free (filename);
@@ -333,12 +418,10 @@ reopen (int fd, int flags)
  *
  */
 GstTSCache *
-gst_ts_cache_new (int fd)
+gst_ts_cache_new (int fd, int output_buffers_size)
 {
   GstTSCache *cache;
-  guint64 nslots;
-  guint64 i;
-  off64_t size, offset = 0;
+  off64_t size = 0;
   int wr_fd, rd_fd = -1;
   struct stat stat_buf;
 
@@ -356,27 +439,17 @@ gst_ts_cache_new (int fd)
 
   cache = g_new (GstTSCache, 1);
 
+  cache->output_buffer_size = output_buffers_size;
   cache->refcount = 1;
 
   g_mutex_init (&cache->lock);
 
-  cache->h_offset = 0;
-  cache->l_rb_offset = 0;
-  cache->h_rb_offset = 0;
+  cache->write_head = 0;
+  cache->read_head = 0;
   cache->write_fd = wr_fd;
   cache->read_fd = rd_fd;
 
-  /* Ring buffer */
-  nslots = size / CACHE_SLOT_SIZE;
-  cache->nslots = nslots;
-
-  cache->slots = (Slot *) g_new (Slot, nslots);
-  for (i = 0; i < cache->nslots; i++) {
-    cache->slots[i].offset = offset;
-    offset += CACHE_SLOT_SIZE;
-    cache->slots[i].stream_offset = INVALID_OFFSET;
-  }
-
+  cache->buffer_size = size;
   gst_ts_cache_flush (cache);
 
   return cache;
@@ -406,10 +479,6 @@ gst_ts_cache_ref (GstTSCache * cache)
 static void
 gst_ts_cache_free (GstTSCache * cache)
 {
-  int i;
-
-  g_free (cache->slots);
-
   close (cache->write_fd);
   cache->write_fd = -1;
   close (cache->read_fd);
@@ -436,49 +505,6 @@ gst_ts_cache_unref (GstTSCache * cache)
     gst_ts_cache_free (cache);
 }
 
-static inline gboolean
-gst_ts_cache_recycle (GstTSCache * cache, Slot * slot)
-{
-  gboolean recycle;
-  recycle = g_atomic_int_compare_and_exchange (&slot->state, STATE_RECYCLE,
-      STATE_EMPTY);
-  if (recycle) {
-    if (slot->stream_offset != INVALID_OFFSET)
-      cache->l_rb_offset = slot->stream_offset + slot->size;
-    slot->stream_offset = INVALID_OFFSET;
-    slot->size = 0;
-  }
-  return recycle;
-}
-
-static inline gboolean
-gst_ts_cache_rollback (GstTSCache * cache, Slot * slot)
-{
-  gboolean rollback;
-  rollback = g_atomic_int_compare_and_exchange (&slot->state, STATE_RECYCLE,
-      STATE_FULL);
-  if (rollback) {
-    g_atomic_int_inc (&cache->fslots);
-  } else if (g_atomic_int_get (&slot->state) == STATE_FULL) {
-    rollback = TRUE;
-  }
-  return rollback;
-}
-
-static inline gboolean
-gst_ts_cache_rollforward (GstTSCache * cache, Slot * slot)
-{
-  gboolean rollforward;
-  rollforward = g_atomic_int_compare_and_exchange (&slot->state, STATE_FULL,
-      STATE_RECYCLE);
-  if (rollforward) {
-    g_atomic_int_add (&cache->fslots, -1);
-  } else if (g_atomic_int_get (&slot->state) == STATE_RECYCLE) {
-    rollforward = TRUE;
-  }
-  return rollforward;
-}
-
 /**
  * gst_ts_cache_pop:
  * @cache: a #GstTSCache
@@ -493,65 +519,15 @@ GstBuffer *
 gst_ts_cache_pop (GstTSCache * cache, gboolean drain)
 {
   GstBuffer *buffer = NULL;
-  Slot *head;
-  gboolean pop;
+  GST_CACHE_LOCK (cache);
 
-#if DEBUG_RINGBUFFER
-  dump_cache_state (cache, "pre-pop");
-#endif
-
-  head = &cache->slots[cache->head];
-
-  if (drain) {
-    if (g_atomic_int_compare_and_exchange (&head->state, STATE_PART,
-            STATE_FULL)) {
-      cache->h_rb_offset = head->stream_offset + head->size;
-      g_atomic_int_inc (&cache->fslots);
-    }
+  buffer = buffer_new_locked (cache);
+  if ( buffer && cache->need_discont ) {
+    GST_BUFFER_FLAG_SET (buffer, GST_BUFFER_FLAG_DISCONT);
+    cache->need_discont = FALSE;
   }
-
-  pop = g_atomic_int_compare_and_exchange (&head->state, STATE_FULL, STATE_POP);
-
-  if (pop) {
-    g_atomic_int_add (&cache->fslots, -1);
-    buffer = gst_slot_buffer_new (cache, head);
-    if (cache->need_discont) {
-      GST_BUFFER_FLAG_SET (buffer, GST_BUFFER_FLAG_DISCONT);
-      cache->need_discont = FALSE;
-    }
-
-    cache->head = (cache->head + 1) % cache->nslots;
-  }
-#if DEBUG_RINGBUFFER
-  dump_cache_state (cache, "post-pop");
-#endif
-
+  GST_CACHE_UNLOCK (cache);
   return buffer;
-}
-
-/* Does a + b being careful to wrap appropriately and taking care of negative
- * numbers, overflows, etc. */
-static guint
-gst_ts_cache_slot_idx_add (GstTSCache * cache, guint a, int b)
-{
-  guint size = cache->nslots;
-
-  /* b_norm is positive and small but will behave as b when used in modulo
-     arithmatic */
-  guint b_norm = (b >= 0) ? (b % size) : size - ((-b) % size);
-
-  return (a + b_norm) % size;
-}
-
-/* Is slot x between a and b where a is the lower bound and b the upper one? */
-static gboolean
-gst_ts_cache_slot_in_range (GstTSCache * cache, guint x, guint a, guint b)
-{
-  g_return_val_if_fail (b < cache->nslots, FALSE);
-  if (a < b)
-    return x >= a && x < b;
-  else
-    return x >= a || x < b;
 }
 
 /**
@@ -566,72 +542,15 @@ gst_ts_cache_slot_in_range (GstTSCache * cache, guint x, guint a, guint b)
 gboolean
 gst_ts_cache_push (GstTSCache * cache, guint8 * data, gsize size)
 {
-  Slot *tail;
-  gsize avail;
-
-#if DEBUG_RINGBUFFER
-  dump_cache_state (cache, "pre-push");
-#endif
-
-  while (size) {
-#if DEBUG_RINGBUFFER
-    GST_DEBUG ("remaining size %d", size);
-    dump_cache_state (cache, "pre-push");
-#endif
-    tail = &cache->slots[cache->tail];
-    gst_ts_cache_recycle (cache, tail);
-    if (slot_available (tail, &avail)) {
-      GstFlowReturn write_result;
-      avail = MIN (avail, size);
-      write_result = slot_write (cache->write_fd, tail, data, avail,
-          cache->h_rb_offset);
-      if (write_result < 0) {
-        /* error or flushing */
-        return FALSE;
-      } else if (write_result == TS_FLOW_SLOT_FILLED) {
-        guint writeout_idx;
-
-        /* Move the tail when the slot is full */
-        cache->tail = (cache->tail + 1) % cache->nslots;
-        cache->h_rb_offset += CACHE_SLOT_SIZE;
-        g_atomic_int_inc (&cache->fslots);
-
-        /* Instruct the kernel to start dumping the just written data to disk
-           so we can later drop it from the page cache. */
-        g_warn_if_fail (sync_file_range (cache->write_fd, tail->offset,
-                CACHE_SLOT_SIZE, SYNC_FILE_RANGE_WRITE) == 0);
-
-        /* Make sure the pages from a while ago have been written out by now. */
-        writeout_idx =
-            gst_ts_cache_slot_idx_add (cache, cache->tail,
-            -PAGE_SYNC_TIME_SLOTS);
-        g_warn_if_fail (sync_file_range (cache->write_fd,
-                cache->slots[writeout_idx].offset, CACHE_SLOT_SIZE,
-                SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE |
-                SYNC_FILE_RANGE_WAIT_AFTER) == 0);
-
-        /* And drop them from the cache unless they're going to be needed by
-         * the read head soon.  e.g. if
-         * (read head < writeout_idx < read_head + READ_KEEP_PAGE_SLOTS) */
-        if (!gst_ts_cache_slot_in_range (cache, writeout_idx, cache->head,
-                gst_ts_cache_slot_idx_add (cache, cache->head,
-                    READ_KEEP_PAGE_SLOTS))) {
-          g_warn_if_fail (posix_fadvise64 (cache->write_fd,
-                  cache->slots[writeout_idx].offset, CACHE_SLOT_SIZE,
-                  POSIX_FADV_DONTNEED) == 0);
-        }
-      }
-      data += avail;
-      size -= avail;
-      cache->h_offset += avail;
-    } else {
-      return FALSE;
-    }
+  GstFlowReturn write_result;
+  GST_CACHE_LOCK (cache);
+  write_result = buffer_write_locked (cache, data, size );
+  if (write_result != GST_FLOW_OK) {
+    /* error or flushing */
+    GST_CACHE_UNLOCK (cache);
+    return FALSE;
   }
-#if DEBUG_RINGBUFFER
-  dump_cache_state (cache, "post-push");
-#endif
-
+  GST_CACHE_UNLOCK (cache);
   return TRUE;
 }
 
@@ -650,9 +569,9 @@ gst_ts_cache_has_offset (GstTSCache * cache, guint64 offset)
   g_return_val_if_fail (cache != NULL, FALSE);
 
   GST_CACHE_LOCK (cache);
-  dump_cache_state (cache, "has_offset");
 
-  ret = (offset >= cache->l_rb_offset && offset < cache->h_offset);
+  ret = (offset >= stream_to_file_offset( cache, get_recycle_head(cache) ) 
+          && offset < stream_to_file_offset( cache, cache->write_head ));
   GST_CACHE_UNLOCK (cache);
   return ret;
 }
@@ -669,9 +588,15 @@ gst_ts_cache_get_total_bytes_received (GstTSCache * cache)
 {
   guint64 offset;
   GST_CACHE_LOCK (cache);
-  offset = cache->h_offset;
+  offset = cache->write_head - get_recycle_head(cache);
   GST_CACHE_UNLOCK (cache);
   return offset;
+}
+
+static guint64 
+clamp( guint64 min, guint64 max, guint64 val)
+{
+  return MAX( MIN( val, max ), min );
 }
 
 /**
@@ -686,69 +611,16 @@ gst_ts_cache_get_total_bytes_received (GstTSCache * cache)
 gboolean
 gst_ts_cache_seek (GstTSCache * cache, guint64 offset)
 {
-  Slot *head;
   g_return_val_if_fail (cache != NULL, FALSE);
-
-  GST_DEBUG ("requested seek at offset: %" G_GUINT64_FORMAT, offset);
-
-  GST_CACHE_LOCK (cache);
-  dump_cache_state (cache, "pre-seek");
-
-  /* clamp to a min/max valid offset */
-  offset = MIN (offset, cache->h_rb_offset);
-  offset = MAX (offset, cache->l_rb_offset);
-  GST_CACHE_UNLOCK (cache);
 
   GST_DEBUG ("seeking for offset: %" G_GUINT64_FORMAT, offset);
 
-  /* First check if we can find it in the ringbuffer */
-  if (offset >= cache->l_rb_offset && offset < cache->h_rb_offset) {
-    guint seeker;
+  GST_CACHE_LOCK (cache);
 
-    GST_DEBUG ("seeking in the ringbuffer");
-    seeker = cache->head;
-    head = &cache->slots[seeker];
+  cache->read_head = clamp ( get_recycle_head(cache), 
+                        cache->write_head, get_recycle_head(cache) + offset );
 
-    if (offset >= head->stream_offset) {
-      if (offset < head->stream_offset + head->size) {
-        GST_DEBUG ("found in current head");
-        /* Already in the requested position so do nothing */
-        gst_ts_cache_rollback (cache, head);
-        goto beach;
-      }
-      /* perform seek in the future */
-      GST_DEBUG ("seeking in the future");
-      do {
-        gst_ts_cache_rollforward (cache, head);
-        seeker = (seeker + 1) % cache->nslots;
-        head = &cache->slots[seeker];
-      } while (!(offset >= head->stream_offset &&
-              offset < head->stream_offset + head->size));
-      gst_ts_cache_rollback (cache, head);
-    } else {
-      /* perform seek in the past */
-      GST_DEBUG ("seeking in the past");
-      gst_ts_cache_rollback (cache, head);
-      do {
-        if (seeker == 0)
-          seeker = cache->nslots - 1;
-        else
-          seeker--;
-        head = &cache->slots[seeker];
-        if (!gst_ts_cache_rollback (cache, head)) {
-          seeker = (seeker + 1) % cache->nslots;
-          break;
-        }
-      } while (!(offset >= head->stream_offset &&
-              offset < head->stream_offset + head->size));
-    }
-    cache->head = seeker;
-    goto beach;
-  }
-
-beach:
-  dump_cache_state (cache, "post-seek");
-
+  GST_CACHE_UNLOCK (cache);
   return TRUE;
 }
 
@@ -763,11 +635,10 @@ gboolean
 gst_ts_cache_is_empty (GstTSCache * cache)
 {
   gboolean is_empty = TRUE;
-
   g_return_val_if_fail (cache != NULL, TRUE);
-
-  is_empty = (g_atomic_int_get (&cache->fslots) == 0);
-
+  GST_CACHE_LOCK (cache);
+  is_empty = ((cache->write_head-cache->read_head ) <= cache->output_buffer_size);
+  GST_CACHE_UNLOCK (cache);
   return is_empty;
 }
 
@@ -786,13 +657,15 @@ gst_ts_cache_fullness (GstTSCache * cache)
   if (gst_ts_cache_is_empty (cache)) {
     return 0;
   } else {
-    Slot *head, *tail;
-    head = &cache->slots[cache->head];
-    tail = &cache->slots[cache->tail];
-    return (tail->stream_offset - head->stream_offset + head->size);
+    guint64 remaining = 0;
+    GST_CACHE_LOCK (cache);
+    remaining =  cache->buffer_size - (cache->write_head - cache->read_head);
+    GST_CACHE_UNLOCK (cache);
+    return remaining;
   }
 }
-
+/* TODO: I don't understand what this could be used for and what the outputs
+  are. */
 void
 gst_ts_cache_buffered_range (GstTSCache * cache, guint64 * begin, guint64 * end)
 {
@@ -800,11 +673,11 @@ gst_ts_cache_buffered_range (GstTSCache * cache, guint64 * begin, guint64 * end)
 
   GST_CACHE_LOCK (cache);
   if (end) {
-    *end = cache->h_offset;
+    *end = stream_to_file_offset(cache, cache->write_head ) ;
   }
 
   if (begin) {
-    *begin = cache->l_rb_offset;
+    *begin = stream_to_file_offset( cache, get_recycle_head(cache) ) ;
   }
   GST_CACHE_UNLOCK (cache);
 }

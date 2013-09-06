@@ -24,7 +24,6 @@
 #define __TS_CACHE_H__
 
 G_BEGIN_DECLS
-#define CACHE_SLOT_SIZE (32 * 1024)     /* Ring Buffer data unit size */
 /**
  * GstTSCache:
  *
@@ -35,7 +34,7 @@ G_BEGIN_DECLS
  */
 typedef struct _GstTSCache GstTSCache;
 
-GstTSCache *gst_ts_cache_new (int fd);
+GstTSCache *gst_ts_cache_new (int fd, int output_buffers_size);
 
 GstTSCache *gst_ts_cache_ref (GstTSCache * cache);
 void gst_ts_cache_unref (GstTSCache * cache);

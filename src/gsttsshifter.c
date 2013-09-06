@@ -93,6 +93,12 @@ G_DEFINE_TYPE (GstTSShifter, gst_ts_shifter, GST_TYPE_ELEMENT);
 
 #define MByte (1024 * 1024)
 
+/* Ideally we want this (output buffer size) to be configurable at runtime. 
+ * From my experience the larger the buffer the better given that the overhead
+ * invovled in passing a buffer around is quite significant.*/
+
+#define TSSHIFTER_OUTPUT_BUFFER_SIZE 65536
+
 static GstStaticPadTemplate src_factory = GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC, GST_PAD_ALWAYS, GST_STATIC_CAPS ("video/mpegts"));
 
@@ -143,7 +149,8 @@ gst_ts_shifter_start (GstTSShifter * ts)
   if (ts->backing_store_fd == -1) {
     GST_ERROR ("Failed to create backing store");
   } else {
-    ts->cache = gst_ts_cache_new (ts->backing_store_fd);
+    ts->cache = gst_ts_cache_new (ts->backing_store_fd,
+      TSSHIFTER_OUTPUT_BUFFER_SIZE);
   }
   FLOW_MUTEX_UNLOCK (ts);
 }
