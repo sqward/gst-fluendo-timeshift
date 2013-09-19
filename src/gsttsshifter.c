@@ -120,7 +120,7 @@ create_backing_store (GstTSShifter * ts, off64_t size)
     goto err_create;
   }
   g_warn_if_fail (unlink (tmpfilename) == 0);
-  if (fallocate (fd, 0, 0, size) != 0) {
+  if (ftruncate (fd, size) != 0) {
     GST_ELEMENT_ERROR (ts, RESOURCE, OPEN_READ_WRITE,
         ("Allocating space for timeshift backing store failed"),
         GST_ERROR_SYSTEM);
