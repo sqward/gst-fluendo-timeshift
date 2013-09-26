@@ -22,7 +22,7 @@
 #define _GST_TS_INDEXER_H_
 
 #include <gst/base/gstbasetransform.h>
-#include "tsindex.h"
+#include "simpleindex.h"
 
 G_BEGIN_DECLS
 #define GST_TYPE_TS_INDEXER   (gst_ts_indexer_get_type())
@@ -38,7 +38,7 @@ struct _GstTSIndexer
   GstBaseTransform base_ts_indexer;
 
   /* Generated Index */
-  GstIndex *index;
+  SimpleIndex *index;
   gboolean own_index;
 
   /* Properties */

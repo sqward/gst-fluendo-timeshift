@@ -55,7 +55,7 @@ gst_ts_seeker_sink_event (GstBaseTransform * trans, GstEvent * event);
 static gboolean
 gst_ts_seeker_src_event (GstBaseTransform * trans, GstEvent * event);
 static void gst_ts_seeker_replace_index (GstTSSeeker * seeker,
-    GstIndex * new_index);
+    SimpleIndex * new_index);
 static gboolean
 gst_ts_seeker_query (GstBaseTransform * trans,
     GstPadDirection direction, GstQuery * query);
@@ -117,9 +117,9 @@ gst_ts_seeker_class_init (GstTSSeekerClass * klass)
       gst_static_pad_template_get (&gst_ts_seeker_src_template));
 
   g_object_class_install_property (gobject_class, PROP_INDEX,
-      g_param_spec_object ("index", "Index",
+      g_param_spec_pointer ("index", "Index",
           "The index from which to read indexing information",
-          GST_TYPE_INDEX, (G_PARAM_READABLE | G_PARAM_WRITABLE)));
+          (G_PARAM_READABLE | G_PARAM_WRITABLE)));
 
   gst_element_class_set_static_metadata (element_class, "Time-shift seeker",
       "Generic", "Transforms time to bytes as required by seek/segment events",
@@ -139,10 +139,10 @@ gst_ts_seeker_init (GstTSSeeker * seeker)
  * @new_index: (allow-none) (transfer full): Replacement index
  */
 static void
-gst_ts_seeker_replace_index (GstTSSeeker * seeker, GstIndex * new_index)
+gst_ts_seeker_replace_index (GstTSSeeker * seeker, SimpleIndex * new_index)
 {
   if (seeker->index) {
-    gst_object_unref (seeker->index);
+    gst_ts_simpleindex_unref (seeker->index);
     seeker->index = NULL;
   }
   if (new_index) {
@@ -221,25 +221,16 @@ gst_ts_seeker_stop (GstBaseTransform * trans)
 static gint64
 gst_ts_seeker_first_offset (GstTSSeeker * ts)
 {
-  GstIndexEntry *entry = NULL;
-  gint64 offset = -1;
-
-  entry = gst_index_get_assoc_entry (ts->index,
-      GST_INDEX_LOOKUP_BEFORE, GST_ASSOCIATION_FLAG_NONE, GST_FORMAT_TIME, 0);
-
-  if (entry) {
-    gst_index_entry_assoc_map (entry, GST_FORMAT_BYTES, &offset);
-  }
-
-  return offset;
+  return simple_indexer_search_offset( ts->index, 0 ) ;
 }
 
 static GstClockTime
 gst_ts_seeker_bytes_to_stream_time (GstTSSeeker * ts, guint64 buffer_offset,
     gboolean accurate)
 {
-  GstIndexEntry *entry = NULL;
   GstClockTime ret;
+  gint64 time;
+  gint64 offset;
 
   if (!ts->index) {
     GST_DEBUG_OBJECT (ts, "no index");
@@ -247,16 +238,10 @@ gst_ts_seeker_bytes_to_stream_time (GstTSSeeker * ts, guint64 buffer_offset,
   }
 
   /* Let's check if we have an index entry for that seek bytes */
-  entry = gst_index_get_assoc_entry (ts->index,
-      GST_INDEX_LOOKUP_BEFORE, GST_ASSOCIATION_FLAG_NONE, GST_FORMAT_BYTES,
-      buffer_offset);
+  time = simple_indexer_search_time ( ts->index, buffer_offset );
 
-  if (entry) {
-    gint64 offset;
-    gint64 time = GST_CLOCK_TIME_NONE;
-
-    gst_index_entry_assoc_map (entry, GST_FORMAT_BYTES, &offset);
-    gst_index_entry_assoc_map (entry, GST_FORMAT_TIME, &time);
+  if ( time >= 0) {
+    offset = simple_indexer_search_offset ( ts->index, time );
 
     GST_DEBUG_OBJECT (ts, "found index entry at %" GST_TIME_FORMAT " pos %"
         G_GINT64_FORMAT, GST_TIME_ARGS (time), offset);
@@ -370,15 +355,14 @@ gst_ts_seeker_get_last_time (GstTSSeeker * base)
 {
   guint64 len = gst_ts_seeker_get_duration_bytes (base);
 
-  return gst_ts_seeker_bytes_to_stream_time (base, len - 1000000, FALSE);
+  return (GstClockTime)gst_ts_seeker_bytes_to_stream_time (base,
+                         len - 1000000, FALSE);
 }
 
 static guint64
 gst_ts_seeker_seek (GstTSSeeker * base, GstSeekType type, gint64 start)
 {
-  GstIndexEntry *entry = NULL;
   gint64 offset = -1;
-  gint64 time;
   GstClockTime pos = 0;
 
   if (type == GST_SEEK_TYPE_NONE) {
@@ -404,15 +388,14 @@ gst_ts_seeker_seek (GstTSSeeker * base, GstSeekType type, gint64 start)
       GST_TIME_ARGS (pos));
 
   /* Let's check if we have an index entry for that seek time */
-  entry = gst_index_get_assoc_entry (base->index, GST_INDEX_LOOKUP_BEFORE,
-      GST_ASSOCIATION_FLAG_NONE, GST_FORMAT_TIME, pos);
+  
+  offset = simple_indexer_search_offset ( base->index, pos);
 
-  if (entry) {
-    gst_index_entry_assoc_map (entry, GST_FORMAT_BYTES, &offset);
-    gst_index_entry_assoc_map (entry, GST_FORMAT_TIME, &time);
-
+  if (offset != -1) {
     GST_DEBUG_OBJECT (base, "found index entry at %" GST_TIME_FORMAT " pos %"
-        G_GUINT64_FORMAT, GST_TIME_ARGS (time), offset);
+        G_GUINT64_FORMAT, 
+        GST_TIME_ARGS (simple_indexer_search_time(base->index, offset)), 
+        offset);
   }
 
 beach:

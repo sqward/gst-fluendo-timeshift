@@ -35,7 +35,6 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <fcntl.h>
-#include <assert.h>
 
 GST_DEBUG_CATEGORY_EXTERN (ts_flow);
 #define GST_CAT_DEFAULT (ts_flow)
@@ -168,7 +167,7 @@ range_overlaps(Range a, Range b)
 static void
 range_consume (Range *r, off64_t bytes)
 {
-  assert (r);
+  g_assert  (r);
   r->offset += bytes;
   if (bytes <= r->size)
     r->size -= bytes;
@@ -219,7 +218,6 @@ buffer_write_locked (GstTSCache * cache, guint8 * data, guint size)
       GST_INFO("Timeshifter: wrapping");
       if (lseek (cache->write_fd, 0, SEEK_SET) == -1) {
         GST_WARNING ("Timeshift buffer seek failed: %s", strerror (errno));
-        GST_CACHE_LOCK (cache);
         return GST_FLOW_ERROR;
       }
     }
@@ -361,7 +359,7 @@ buffer_new_locked (GstTSCache * cache)
   GST_CACHE_LOCK (cache);
 
   if ( read_bytes < 0 ) {
-    GST_ERROR ("couldn't read from the ringbuffer (read) failed%s", 
+    GST_ERROR ("couldn't read from the ringbuffer (read) failed %s", 
       strerror (errno));
   }
 

@@ -21,7 +21,7 @@
 #define _GST_TS_SEEKER_H_
 
 #include <gst/base/gstbasetransform.h>
-#include "tsindex.h"
+#include "simpleindex.h"
 
 G_BEGIN_DECLS
 #define GST_TYPE_TS_SEEKER   (gst_ts_seeker_get_type())
@@ -37,7 +37,7 @@ struct _GstTSSeeker
   GstBaseTransform base_timeshiftseeker;
 
   /* Generated Index */
-  GstIndex *index;
+  SimpleIndex *index;
 
   gboolean timestamp_next_buffer;
 };

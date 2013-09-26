@@ -21,6 +21,7 @@
 #define __GST_TS_SHIFTERBIN_H__
 
 #include <gst/gst.h>
+#include "simpleindex.h"
 
 G_BEGIN_DECLS
 #define GST_TYPE_TS_SHIFTER_BIN \
@@ -45,6 +46,7 @@ struct _GstTSShifterBin
   GstElement *indexer;
   GstElement *timeshifter;
   GstElement *seeker;
+  SimpleIndex *index;
 };
 
 struct _GstTSShifterBinClass

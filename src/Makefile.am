@@ -9,8 +9,7 @@ libgsttstimeshift_la_SOURCES = \
   gsttsstamper.c \
   gsttstimeshift.c \
   tscache.c \
-  tsindex.c \
-  tsmemindex.c
+  simpleindex.c
 
 libgsttstimeshift_la_CFLAGS = \
  -I$(top_srcdir)/common \
@@ -36,4 +35,5 @@ noinst_HEADERS = \
   gsttsshifterbin.h \
   gsttsstamper.h \
   tscache.h \
-  tsindex.h
+  simpleindex.h
+

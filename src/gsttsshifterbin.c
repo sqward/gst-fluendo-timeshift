@@ -19,7 +19,6 @@
 
 #include "gsttsshifterbin.h"
 #include "tscache.h"
-#include "tsindex.h"
 
 GST_DEBUG_CATEGORY_EXTERN (ts_shifterbin);
 #define GST_CAT_DEFAULT ts_shifterbin
@@ -33,10 +32,12 @@ enum
 {
   PROP_0,
   PROP_BACKING_STORE_FD,
+  PROP_INDEX_STORE_FD,
   PROP_LAST
 };
 
 static void gst_ts_shifter_bin_handle_message (GstBin * bin, GstMessage * msg);
+static void gst_ts_shifter_bin_dispose (GObject * object);
 
 static GstStaticPadTemplate srctemplate = GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC,
@@ -60,6 +61,10 @@ gst_ts_shifter_bin_set_property (GObject * object,
       g_object_set_property (G_OBJECT (ts_bin->timeshifter),
           pspec->name, value);
       break;
+    case PROP_INDEX_STORE_FD:
+      /* Forward directly onto the cache */
+      simple_index_set_fd( ts_bin->index, g_value_get_int (value) );
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -74,6 +79,12 @@ gst_ts_shifter_bin_get_property (GObject * object,
 
   switch (prop_id) {
     case PROP_BACKING_STORE_FD:
+      /* Forward directly onto the cache */
+      g_object_get_property (G_OBJECT (ts_bin->timeshifter),
+          pspec->name, value);
+      break;
+
+    case PROP_INDEX_STORE_FD:
       /* Forward directly onto the cache */
       g_object_get_property (G_OBJECT (ts_bin->timeshifter),
           pspec->name, value);
@@ -98,11 +109,18 @@ gst_ts_shifter_bin_class_init (GstTSShifterBinClass * klass)
 
   gobject_class->set_property = gst_ts_shifter_bin_set_property;
   gobject_class->get_property = gst_ts_shifter_bin_get_property;
+  gobject_class->dispose = gst_ts_shifter_bin_dispose;
 
   g_object_class_install_property (gobject_class, PROP_BACKING_STORE_FD,
       g_param_spec_int ("backing-store-fd",
           "Backing store FD",
           "File descriptor of a file in which to store video stream",
+          -1, G_MAXINT, -1, G_PARAM_READWRITE | G_PARAM_CONSTRUCT));
+  
+  g_object_class_install_property (gobject_class, PROP_INDEX_STORE_FD,
+      g_param_spec_int ("index-store-fd",
+          "Index backing store FD",
+          "File descriptor of a file in which to video stream index will be stored",
           -1, G_MAXINT, -1, G_PARAM_READWRITE | G_PARAM_CONSTRUCT));
 
   gst_element_class_add_pad_template (gstelement_class,
@@ -121,6 +139,27 @@ gst_ts_shifter_bin_class_init (GstTSShifterBinClass * klass)
 }
 
 static void
+gst_element_clear (GstElement ** elem)
+{
+  g_return_if_fail (elem);
+  if (*elem) {
+    g_object_unref (G_OBJECT (*elem));
+    *elem = NULL;
+  }
+}
+
+void
+gst_ts_shifter_bin_dispose (GObject * object)
+{
+  GstTSShifterBin *ts_bin = GST_TS_SHIFTER_BIN (object);
+  if (ts_bin->index) {
+    gst_ts_simpleindex_unref(ts_bin->index);
+    ts_bin->index = NULL;
+  }
+  G_OBJECT_CLASS (gst_ts_shifter_bin_parent_class)->dispose (object);
+}
+
+static void
 mirror_pad (GstElement * element, const gchar * static_pad_name, GstBin * bin)
 {
   GstPad *orig_pad, *ghost_pad;
@@ -136,19 +175,8 @@ mirror_pad (GstElement * element, const gchar * static_pad_name, GstBin * bin)
 }
 
 static void
-gst_element_clear (GstElement ** elem)
-{
-  g_return_if_fail (elem);
-  if (*elem) {
-    g_object_unref (G_OBJECT (*elem));
-    *elem = NULL;
-  }
-}
-
-static void
 gst_ts_shifter_bin_init (GstTSShifterBin * ts_bin)
 {
-  GstIndex *index = NULL;
   GstBin *bin = GST_BIN (ts_bin);
 
   ts_bin->parser = gst_element_factory_make ("tsparse", "parser");
@@ -166,10 +194,11 @@ gst_ts_shifter_bin_init (GstTSShifterBin * ts_bin)
     return;
   }
 
-  index = gst_index_factory_make ("memindex");
-  g_object_set (G_OBJECT (ts_bin->indexer), "index", index, NULL);
-  g_object_set (G_OBJECT (ts_bin->seeker), "index", index, NULL);
-  g_object_unref (index);
+  ts_bin->index = simpleindex_new();
+  gst_ts_simpleindex_ref(ts_bin->index);
+  g_object_set (G_OBJECT (ts_bin->indexer), "index", ts_bin->index, NULL);
+  gst_ts_simpleindex_ref(ts_bin->index);
+  g_object_set (G_OBJECT (ts_bin->seeker), "index", ts_bin->index, NULL);
 
   mirror_pad (ts_bin->parser, "sink", bin);
   mirror_pad (ts_bin->seeker, "src", bin);

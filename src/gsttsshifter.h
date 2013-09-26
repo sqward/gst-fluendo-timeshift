@@ -71,6 +71,7 @@ struct _GstTSShifter
   GstEvent *stream_start_event;
 
   int backing_store_fd;
+  int index_store_fd;
 };
 
 struct _GstTSShifterClass

@@ -74,7 +74,7 @@ static gboolean gst_ts_indexer_stop (GstBaseTransform * trans);
 static GstFlowReturn
 gst_ts_indexer_transform_ip (GstBaseTransform * trans, GstBuffer * buf);
 static void gst_ts_indexer_replace_index (GstTSIndexer *
-    base, GstIndex * new_index, gboolean own);
+    base, SimpleIndex * new_index, gboolean own);
 static void gst_ts_indexer_collect_time (GstTSIndexer *
     base, guint8 * data, gsize size);
 
@@ -143,9 +143,9 @@ gst_ts_indexer_class_init (GstTSIndexerClass * klass)
       GST_DEBUG_FUNCPTR (gst_ts_indexer_transform_ip);
 
   g_object_class_install_property (gobject_class, PROP_INDEX,
-      g_param_spec_object ("index", "Index",
+      g_param_spec_pointer ("index", "Index",
           "The index into which to write indexing information",
-          GST_TYPE_INDEX, (G_PARAM_READABLE | G_PARAM_WRITABLE)));
+          (G_PARAM_READABLE | G_PARAM_WRITABLE)));
   g_object_class_install_property (gobject_class, PROP_PCR_PID,
       g_param_spec_int ("pcr-pid", "PCR pid",
           "Defines the PCR pid to collect the time (-1 = undefined)",
@@ -182,10 +182,10 @@ gst_ts_indexer_init (GstTSIndexer * indexer)
  */
 static void
 gst_ts_indexer_replace_index (GstTSIndexer * base,
-    GstIndex * new_index, gboolean own)
+    SimpleIndex * new_index, gboolean own)
 {
   if (base->index) {
-    gst_object_unref (base->index);
+    gst_ts_simpleindex_unref (base->index);
     base->index = NULL;
   }
   if (new_index) {
@@ -282,7 +282,7 @@ gst_ts_indexer_start (GstBaseTransform * trans)
   if (G_UNLIKELY (!indexer->index)) {
     GST_DEBUG_OBJECT (indexer, "no index provided creating our own");
     gst_ts_indexer_replace_index (indexer,
-        gst_index_factory_make ("memindex"), FALSE);
+       simpleindex_new() , FALSE);
   }
 
   return TRUE;
@@ -334,17 +334,7 @@ is_next_sync_valid (const guint8 * in_data, guint size, guint offset)
 static inline void
 add_index_entry (GstTSIndexer * base, GstClockTime time, guint64 offset)
 {
-  GstIndexAssociation associations[2];
-
-  GST_LOG_OBJECT (base, "adding association %" GST_TIME_FORMAT "-> %"
-      G_GUINT64_FORMAT, GST_TIME_ARGS (time), offset);
-  associations[0].format = GST_FORMAT_TIME;
-  associations[0].value = time;
-  associations[1].format = GST_FORMAT_BYTES;
-  associations[1].value = offset;
-
-  gst_index_add_associationv (base->index, GST_ASSOCIATION_FLAG_NONE, 2,
-      (const GstIndexAssociation *) &associations);
+  simple_indexer_add_entry( base->index, (guint64) time, offset );
 }
 
 static inline guint64
